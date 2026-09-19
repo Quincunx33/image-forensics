@@ -1,0 +1,2402 @@
+// ===== Cargo.toml =====
+[package]
+name = "forensic-engine"
+version = "1.0.0"
+edition = "2021"
+authors = ["Tracebench"]
+description = "Local digital-image forensic detectors compiled to wasm32"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jpeg-decoder = { version = "0.3.2", default-features = false }
+jpeg-encoder = "0.6.1"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+
+// ===== src/clone.rs =====
+//! Copy-move / clone detector: overlapping block descriptors + offset clustering.
+
+use crate::json::Json;
+use crate::stats::{scale_to_u8, Stats};
+
+#[derive(Clone, Copy)]
+struct Feat {
+    x: u16,
+    y: u16,
+    d: [u8; 16],
+}
+
+fn hamming_like(a: &[u8; 16], b: &[u8; 16]) -> u32 {
+    let mut s = 0u32;
+    for i in 0..16 {
+        s += (a[i] as i32 - b[i] as i32).unsigned_abs();
+    }
+    s
+}
+
+pub struct CloneResult {
+    pub stats: Stats,
+    pub json: String,
+}
+
+pub fn copy_move(
+    y: &[f32],
+    w: u32,
+    h: u32,
+    block: u32,
+    stride: u32,
+    threshold: u32,
+    min_region: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> CloneResult {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut mask = vec![0f32; n];
+    let bs = block.clamp(8, 32) as usize;
+    let st = stride.clamp(4, 32) as usize;
+    let thr = threshold.clamp(4, 400);
+    let min_r = min_region.clamp(2, 200) as usize;
+
+    if w < bs + 4 || h < bs + 4 {
+        let stats = scale_to_u8(&mask, out, gain, percentile);
+        return CloneResult {
+            stats,
+            json: "{\"matches\":[],\"clusters\":0,\"status\":\"insufficient\"}".into(),
+        };
+    }
+
+    let mut feats: Vec<Feat> = Vec::new();
+    let sub = bs / 4;
+    let mut yy = 0;
+    while yy + bs <= h {
+        let mut xx = 0;
+        while xx + bs <= w {
+            let mut d = [0u8; 16];
+            let mut k = 0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let mut s = 0.0;
+                    let mut c = 0.0;
+                    for j in 0..sub {
+                        for i in 0..sub {
+                            s += y[(yy + sy * sub + j) * w + (xx + sx * sub + i)];
+                            c += 1.0;
+                        }
+                    }
+                    d[k] = (s / c).clamp(0.0, 255.0) as u8;
+                    k += 1;
+                }
+            }
+            feats.push(Feat {
+                x: xx as u16,
+                y: yy as u16,
+                d,
+            });
+            xx += st;
+            if feats.len() > 48_000 {
+                break;
+            }
+        }
+        yy += st;
+        if feats.len() > 48_000 {
+            break;
+        }
+    }
+
+    // Lexicographic sort on first 4 descriptor bytes so neighbors in feature space are nearby
+    feats.sort_by(|a, b| a.d[0..4].cmp(&b.d[0..4]));
+
+    #[derive(Clone)]
+    struct Hit {
+        ax: u16,
+        ay: u16,
+        bx: u16,
+        by: u16,
+        dx: i16,
+        dy: i16,
+        sim: u32,
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    let min_dist2 = (bs as i32 * 2).pow(2);
+
+    for i in 0..feats.len() {
+        let a = feats[i];
+        let lim = (i + 12).min(feats.len());
+        for j in i + 1..lim {
+            let b = feats[j];
+            let dist = hamming_like(&a.d, &b.d);
+            if dist > thr {
+                continue;
+            }
+            let dx = a.x as i32 - b.x as i32;
+            let dy = a.y as i32 - b.y as i32;
+            if dx * dx + dy * dy < min_dist2 {
+                continue;
+            }
+            // Canonicalize offset so A is "left/top"
+            let (ax, ay, bx, by, odx, ody) = if (a.y, a.x) < (b.y, b.x) {
+                (a.x, a.y, b.x, b.y, b.x as i16 - a.x as i16, b.y as i16 - a.y as i16)
+            } else {
+                (b.x, b.y, a.x, a.y, a.x as i16 - b.x as i16, a.y as i16 - b.y as i16)
+            };
+            hits.push(Hit {
+                ax,
+                ay,
+                bx,
+                by,
+                dx: odx,
+                dy: ody,
+                sim: dist,
+            });
+            if hits.len() > 8_000 {
+                break;
+            }
+        }
+        if hits.len() > 8_000 {
+            break;
+        }
+    }
+
+    // Cluster by quantized displacement
+    use std::collections::HashMap;
+    let mut buckets: HashMap<(i16, i16), Vec<usize>> = HashMap::new();
+    for (i, h) in hits.iter().enumerate() {
+        let qx = (h.dx / 4) * 4;
+        let qy = (h.dy / 4) * 4;
+        buckets.entry((qx, qy)).or_default().push(i);
+    }
+    let mut clusters = 0u32;
+    let mut reported: Vec<&Hit> = Vec::new();
+    for (_k, idxs) in buckets.iter() {
+        if idxs.len() < min_r {
+            continue;
+        }
+        clusters += 1;
+        for &i in idxs {
+            let h = &hits[i];
+            paint_block(&mut mask, w, h.ax as usize, h.ay as usize, bs, 1.0);
+            paint_block(&mut mask, w, h.bx as usize, h.by as usize, bs, 1.0);
+            if reported.len() < 80 {
+                reported.push(h);
+            }
+        }
+    }
+
+    let stats = scale_to_u8(&mask, out, gain, percentile);
+    let mut j = Json::new();
+    j.begin_obj();
+    j.num_field("clusters", clusters as f64);
+    j.num_field("hits", hits.len() as f64);
+    j.num_field("blocks", feats.len() as f64);
+    j.str_field(
+        "status",
+        if clusters == 0 {
+            "no significant match"
+        } else {
+            "potential indicator"
+        },
+    );
+    j.key("matches");
+    j.begin_arr();
+    for (i, h) in reported.iter().enumerate() {
+        j.begin_obj();
+        j.num_field("ax", h.ax as f64);
+        j.num_field("ay", h.ay as f64);
+        j.num_field("bx", h.bx as f64);
+        j.num_field("by", h.by as f64);
+        j.num_field("dx", h.dx as f64);
+        j.num_field("dy", h.dy as f64);
+        j.num_field("distance", h.sim as f64);
+        j.end_obj();
+        if i + 1 < reported.len() {
+            j.comma();
+        }
+    }
+    j.end_arr();
+    j.end_obj();
+    CloneResult {
+        stats,
+        json: j.into_string(),
+    }
+}
+
+fn paint_block(mask: &mut [f32], w: usize, x: usize, y: usize, bs: usize, v: f32) {
+    let h = mask.len() / w;
+    for j in 0..bs {
+        let yy = y + j;
+        if yy >= h {
+            break;
+        }
+        for i in 0..bs {
+            let xx = x + i;
+            if xx >= w {
+                break;
+            }
+            let idx = yy * w + xx;
+            if mask[idx] < v {
+                mask[idx] = v;
+            }
+        }
+    }
+}
+
+
+// ===== src/dct.rs =====
+//! 8×8 DCT-II, frequency band energy maps, double-compression periodicity.
+
+use crate::stats::{scale_to_u8, Stats};
+
+const CS: [f32; 8] = [
+    0.70710678, 0.49039264, 0.46193977, 0.41573481, 0.35355339, 0.27778512, 0.19134172, 0.09754516,
+];
+
+fn dct_1d(x: &[f32; 8], y: &mut [f32; 8]) {
+    // Scaled DCT-II, orthonormal-ish coefficients for energy maps (not JPEG exact).
+    for k in 0..8 {
+        let mut s = 0.0;
+        for n in 0..8 {
+            let ang = std::f32::consts::PI / 8.0 * k as f32 * (n as f32 + 0.5);
+            s += x[n] * ang.cos();
+        }
+        y[k] = s * if k == 0 { CS[0] } else { 0.5 };
+    }
+}
+
+fn dct_2d(block: &[f32; 64], out: &mut [f32; 64]) {
+    let mut tmp = [0f32; 64];
+    let mut row = [0f32; 8];
+    let mut drow = [0f32; 8];
+    for r in 0..8 {
+        for c in 0..8 {
+            row[c] = block[r * 8 + c];
+        }
+        dct_1d(&row, &mut drow);
+        for c in 0..8 {
+            tmp[r * 8 + c] = drow[c];
+        }
+    }
+    let mut col = [0f32; 8];
+    let mut dcol = [0f32; 8];
+    for c in 0..8 {
+        for r in 0..8 {
+            col[r] = tmp[r * 8 + c];
+        }
+        dct_1d(&col, &mut dcol);
+        for r in 0..8 {
+            out[r * 8 + c] = dcol[r];
+        }
+    }
+}
+
+/// band: 0 low (u+v<=2), 1 mid, 2 high (u+v>=8), 3 all AC energy, 4 block artifact
+pub fn frequency_map(
+    y: &[f32],
+    w: u32,
+    h: u32,
+    band: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut r = vec![0f32; n];
+    let bw = w / 8;
+    let bh = h / 8;
+    if band == 4 {
+        // Discontinuity across 8×8 boundaries
+        for yy in 0..h {
+            for xx in 0..w {
+                let mut e = 0.0;
+                if xx > 0 && xx % 8 == 0 {
+                    e += (y[yy * w + xx] - y[yy * w + xx - 1]).abs();
+                }
+                if yy > 0 && yy % 8 == 0 {
+                    e += (y[yy * w + xx] - y[(yy - 1) * w + xx]).abs();
+                }
+                r[yy * w + xx] = e;
+            }
+        }
+        return scale_to_u8(&r, out, gain, percentile);
+    }
+    let mut block = [0f32; 64];
+    let mut coeff = [0f32; 64];
+    for by in 0..bh {
+        for bx in 0..bw {
+            for j in 0..8 {
+                for i in 0..8 {
+                    block[j * 8 + i] = y[(by * 8 + j) * w + (bx * 8 + i)];
+                }
+            }
+            dct_2d(&block, &mut coeff);
+            let mut e = 0.0;
+            for v in 0..8 {
+                for u in 0..8 {
+                    if u == 0 && v == 0 {
+                        continue;
+                    }
+                    let s = u + v;
+                    let include = match band {
+                        0 => s <= 2,
+                        1 => s > 2 && s < 8,
+                        2 => s >= 8,
+                        _ => true,
+                    };
+                    if include {
+                        e += coeff[v * 8 + u] * coeff[v * 8 + u];
+                    }
+                }
+            }
+            e = e.sqrt();
+            for j in 0..8 {
+                for i in 0..8 {
+                    r[(by * 8 + j) * w + (bx * 8 + i)] = e;
+                }
+            }
+        }
+    }
+    scale_to_u8(&r, out, gain, percentile)
+}
+
+/// Histogram-periodicity indicator map for possible double JPEG (aligned).
+pub fn double_jpeg_map(
+    y: &[f32],
+    w: u32,
+    h: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> (Stats, f64) {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let bw = w / 8;
+    let bh = h / 8;
+    let mut hist = [0u32; 512];
+    let mut block = [0f32; 64];
+    let mut coeff = [0f32; 64];
+    let mut ac_abs: Vec<i32> = Vec::with_capacity(bw * bh * 16);
+    for by in 0..bh {
+        for bx in 0..bw {
+            for j in 0..8 {
+                for i in 0..8 {
+                    block[j * 8 + i] = y[(by * 8 + j) * w + (bx * 8 + i)] - 128.0;
+                }
+            }
+            dct_2d(&block, &mut coeff);
+            // Use a mid-frequency coefficient often quantized (u=1,v=0)
+            let c = coeff[1].round() as i32;
+            ac_abs.push(c);
+            let bin = (c + 256).clamp(0, 511) as usize;
+            hist[bin] += 1;
+        }
+    }
+    // Periodicity score: peak of autocorrelation of the histogram (lags 2..16)
+    let mut best_lag = 0;
+    let mut best = 0.0f64;
+    let mean: f64 = hist.iter().map(|x| *x as f64).sum::<f64>() / 512.0;
+    for lag in 2..17 {
+        let mut acc = 0.0;
+        let mut c = 0.0;
+        for i in 0..(512 - lag) {
+            acc += (hist[i] as f64 - mean) * (hist[i + lag] as f64 - mean);
+            c += 1.0;
+        }
+        let v = acc / c;
+        if v > best {
+            best = v;
+            best_lag = lag;
+        }
+    }
+    let energy: f64 = hist.iter().map(|x| {
+        let d = *x as f64 - mean;
+        d * d
+    }).sum::<f64>()
+        / 512.0;
+    let score = if energy > 1.0 { best / energy } else { 0.0 };
+
+    // Local map: blocks whose DCT (1,0) is near a multiple of estimated period
+    let mut r = vec![0f32; n];
+    let period = best_lag.max(2) as f32;
+    let mut idx = 0;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let c = ac_abs[idx] as f32;
+            idx += 1;
+            let nearest = (c / period).round() * period;
+            let dist = (c - nearest).abs();
+            let v = (1.0 - dist / (period * 0.5)).max(0.0);
+            for j in 0..8 {
+                for i in 0..8 {
+                    r[(by * 8 + j) * w + (bx * 8 + i)] = v;
+                }
+            }
+        }
+    }
+    let stats = scale_to_u8(&r, out, gain, percentile);
+    (stats, score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dct_dc_energy() {
+        let block = [1.0f32; 64];
+        let mut out = [0f32; 64];
+        dct_2d(&block, &mut out);
+        // DC should dominate a constant block
+        assert!(out[0].abs() > out[1].abs());
+        assert!(out[0].abs() > 0.5);
+    }
+}
+
+
+// ===== src/ela.rs =====
+//! Error Level Analysis: JPEG re-encode, absolute residual, percentile scale.
+
+use std::io::Cursor;
+
+use jpeg_decoder::Decoder;
+use jpeg_encoder::{ColorType, Encoder};
+
+use crate::stats::{luma, scale_to_u8, Stats};
+
+#[derive(Clone, Copy)]
+pub struct ElaParams {
+    pub quality: u8,
+    pub gain: f32,
+    pub percentile: f32,
+}
+
+impl Default for ElaParams {
+    fn default() -> Self {
+        Self {
+            quality: 90,
+            gain: 12.0,
+            percentile: 98.0,
+        }
+    }
+}
+
+pub fn error_level(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    params: ElaParams,
+    out: &mut [u8],
+) -> Result<Stats, &'static str> {
+    if w == 0 || h == 0 || w > 65535 || h > 65535 {
+        return Err("invalid dimensions");
+    }
+    let n = (w as usize) * (h as usize);
+    if rgba.len() < n * 4 || out.len() < n {
+        return Err("buffer");
+    }
+    let mut rgb = Vec::with_capacity(n * 3);
+    for i in 0..n {
+        rgb.push(rgba[i * 4]);
+        rgb.push(rgba[i * 4 + 1]);
+        rgb.push(rgba[i * 4 + 2]);
+    }
+    let mut jpeg = Vec::new();
+    {
+        let enc = Encoder::new(&mut jpeg, params.quality.clamp(1, 100));
+        enc.encode(&rgb, w as u16, h as u16, ColorType::Rgb)
+            .map_err(|_| "jpeg encode")?;
+    }
+    let mut dec = Decoder::new(Cursor::new(&jpeg));
+    let decoded = dec.decode().map_err(|_| "jpeg decode")?;
+    let info = dec.info().ok_or("jpeg info")?;
+    let dw = info.width as usize;
+    let dh = info.height as usize;
+    let mut residual = vec![0f32; n];
+    match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            let m = dw.min(w as usize) * dh.min(h as usize);
+            let _ = m;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = y * w as usize + x;
+                    if x < dw && y < dh {
+                        let j = (y * dw + x) * 3;
+                        let dr = (rgba[i * 4] as i16 - decoded[j] as i16).unsigned_abs() as f32;
+                        let dg =
+                            (rgba[i * 4 + 1] as i16 - decoded[j + 1] as i16).unsigned_abs() as f32;
+                        let db =
+                            (rgba[i * 4 + 2] as i16 - decoded[j + 2] as i16).unsigned_abs() as f32;
+                        residual[i] = 0.2126 * dr + 0.7152 * dg + 0.0722 * db;
+                    }
+                }
+            }
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = y * w as usize + x;
+                    if x < dw && y < dh {
+                        let y0 = luma(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+                        residual[i] = (y0 - decoded[y * dw + x] as f32).abs();
+                    }
+                }
+            }
+        }
+        _ => return Err("unsupported jpeg pixel format"),
+    }
+    Ok(scale_to_u8(
+        &residual,
+        out,
+        params.gain,
+        params.percentile,
+    ))
+}
+
+
+// ===== src/jpeg.rs =====
+//! JPEG marker walk, quantization tables, SOF geometry, APP metadata.
+
+use crate::json::{Json, hex_preview};
+
+#[derive(Clone, Debug, Default)]
+pub struct JpegInfo {
+    pub is_jpeg: bool,
+    pub progressive: bool,
+    pub components: u8,
+    pub width: u16,
+    pub height: u16,
+    pub precision: u8,
+    pub restart_interval: u16,
+    pub h_samp: [u8; 4],
+    pub v_samp: [u8; 4],
+    pub q_sel: [u8; 4],
+    pub qtables: Vec<(u8, [u16; 64])>,
+    pub markers: Vec<Marker>,
+    pub comments: Vec<String>,
+    pub app1: Vec<Vec<u8>>,
+    pub thumbnail: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Marker {
+    pub name: String,
+    pub offset: usize,
+    pub length: usize,
+}
+
+const MARKER_NAMES: &[(u8, &str)] = &[
+    (0xd8, "SOI"),
+    (0xd9, "EOI"),
+    (0xda, "SOS"),
+    (0xdb, "DQT"),
+    (0xc4, "DHT"),
+    (0xdd, "DRI"),
+    (0xfe, "COM"),
+    (0xe0, "APP0"),
+    (0xe1, "APP1"),
+    (0xe2, "APP2"),
+    (0xe3, "APP3"),
+    (0xe4, "APP4"),
+    (0xe5, "APP5"),
+    (0xe6, "APP6"),
+    (0xe7, "APP7"),
+    (0xe8, "APP8"),
+    (0xe9, "APP9"),
+    (0xea, "APP10"),
+    (0xeb, "APP11"),
+    (0xec, "APP12"),
+    (0xed, "APP13"),
+    (0xee, "APP14"),
+    (0xef, "APP15"),
+    (0xc0, "SOF0"),
+    (0xc1, "SOF1"),
+    (0xc2, "SOF2"),
+    (0xc3, "SOF3"),
+    (0xc5, "SOF5"),
+    (0xc6, "SOF6"),
+    (0xc7, "SOF7"),
+    (0xc9, "SOF9"),
+    (0xca, "SOF10"),
+    (0xcb, "SOF11"),
+];
+
+fn marker_name(m: u8) -> String {
+    if (0xd0..=0xd7).contains(&m) {
+        return format!("RST{}", m - 0xd0);
+    }
+    MARKER_NAMES
+        .iter()
+        .find(|(k, _)| *k == m)
+        .map(|(_, n)| n.to_string())
+        .unwrap_or_else(|| format!("FF{:02X}", m))
+}
+
+pub fn parse_jpeg(bytes: &[u8]) -> JpegInfo {
+    let mut info = JpegInfo::default();
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return info;
+    }
+    info.is_jpeg = true;
+    info.markers.push(Marker {
+        name: "SOI".into(),
+        offset: 0,
+        length: 2,
+    });
+    let mut i = 2usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0xff {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && bytes[i] == 0xff {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let m = bytes[i];
+        i += 1;
+        if m == 0x00 || m == 0xff {
+            continue;
+        }
+        if m == 0xd9 {
+            info.markers.push(Marker {
+                name: "EOI".into(),
+                offset: i - 2,
+                length: 2,
+            });
+            break;
+        }
+        if m == 0xda {
+            info.markers.push(Marker {
+                name: "SOS".into(),
+                offset: i - 2,
+                length: bytes.len().saturating_sub(i - 2),
+            });
+            // Scan payload — skip stuffed 0xFF00 until next marker we don't fully parse.
+            break;
+        }
+        if (0xd0..=0xd7).contains(&m) {
+            info.markers.push(Marker {
+                name: marker_name(m),
+                offset: i - 2,
+                length: 2,
+            });
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        let len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+        let start = i - 2;
+        let payload = i + 2;
+        let end = (i + len).min(bytes.len());
+        info.markers.push(Marker {
+            name: marker_name(m),
+            offset: start,
+            length: 2 + len,
+        });
+        match m {
+            0xdb => parse_dqt(&bytes[payload..end], &mut info),
+            0xc0 | 0xc1 | 0xc2 => {
+                info.progressive = m == 0xc2;
+                parse_sof(&bytes[payload..end], &mut info);
+            }
+            0xdd if end - payload >= 2 => {
+                info.restart_interval = u16::from_be_bytes([bytes[payload], bytes[payload + 1]]);
+            }
+            0xfe => {
+                if let Ok(s) = std::str::from_utf8(&bytes[payload..end]) {
+                    info.comments.push(s.trim_matches('\0').to_string());
+                }
+            }
+            0xe1 => {
+                info.app1.push(bytes[payload..end].to_vec());
+                if let Some(thumb) = extract_exif_thumbnail(&bytes[payload..end]) {
+                    info.thumbnail = Some(thumb);
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    info
+}
+
+fn parse_dqt(payload: &[u8], info: &mut JpegInfo) {
+    let mut p = 0;
+    while p < payload.len() {
+        let pq_tq = payload[p];
+        p += 1;
+        let precision = pq_tq >> 4;
+        let id = pq_tq & 0x0f;
+        let mut table = [0u16; 64];
+        if precision == 0 {
+            if p + 64 > payload.len() {
+                break;
+            }
+            for i in 0..64 {
+                table[i] = payload[p + i] as u16;
+            }
+            p += 64;
+        } else {
+            if p + 128 > payload.len() {
+                break;
+            }
+            for i in 0..64 {
+                table[i] = u16::from_be_bytes([payload[p + i * 2], payload[p + i * 2 + 1]]);
+            }
+            p += 128;
+        }
+        info.qtables.push((id, table));
+    }
+}
+
+fn parse_sof(payload: &[u8], info: &mut JpegInfo) {
+    if payload.len() < 6 {
+        return;
+    }
+    info.precision = payload[0];
+    info.height = u16::from_be_bytes([payload[1], payload[2]]);
+    info.width = u16::from_be_bytes([payload[3], payload[4]]);
+    info.components = payload[5];
+    let mut p = 6;
+    for c in 0..info.components.min(4) {
+        if p + 3 > payload.len() {
+            break;
+        }
+        let _id = payload[p];
+        let samp = payload[p + 1];
+        info.h_samp[c as usize] = samp >> 4;
+        info.v_samp[c as usize] = samp & 0x0f;
+        info.q_sel[c as usize] = payload[p + 2];
+        p += 3;
+    }
+}
+
+/// Very small TIFF walker: locate JPEGInterchangeFormat (0x0201) + length (0x0202).
+fn extract_exif_thumbnail(app1: &[u8]) -> Option<Vec<u8>> {
+    let body = if app1.starts_with(b"Exif\0\0") {
+        &app1[6..]
+    } else {
+        return None;
+    };
+    if body.len() < 8 {
+        return None;
+    }
+    let le = body.starts_with(b"II");
+    let be = body.starts_with(b"MM");
+    if !le && !be {
+        return None;
+    }
+    let u16r = |b: &[u8], o: usize| -> Option<u16> {
+        let s = b.get(o..o + 2)?;
+        Some(if le {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            u16::from_be_bytes([s[0], s[1]])
+        })
+    };
+    let u32r = |b: &[u8], o: usize| -> Option<u32> {
+        let s = b.get(o..o + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+    let ifd0 = u32r(body, 4)? as usize;
+    // thumbnail is typically IFD1
+    let n0 = u16r(body, ifd0)? as usize;
+    let next = ifd0 + 2 + n0 * 12;
+    let ifd1 = u32r(body, next)? as usize;
+    if ifd1 == 0 || ifd1 + 2 > body.len() {
+        return None;
+    }
+    let n1 = u16r(body, ifd1)? as usize;
+    let mut off = None;
+    let mut len = None;
+    for i in 0..n1 {
+        let e = ifd1 + 2 + i * 12;
+        let tag = u16r(body, e)?;
+        let val = u32r(body, e + 8)?;
+        match tag {
+            0x0201 => off = Some(val as usize),
+            0x0202 => len = Some(val as usize),
+            _ => {}
+        }
+    }
+    let o = off?;
+    let l = len?;
+    if o + l <= body.len() && l > 16 {
+        let t = body[o..o + l].to_vec();
+        if t.len() >= 2 && t[0] == 0xff && t[1] == 0xd8 {
+            return Some(t);
+        }
+    }
+    None
+}
+
+pub fn jpeg_to_json(info: &JpegInfo, file_len: usize) -> String {
+    let mut j = Json::new();
+    j.begin_obj();
+    j.bool_field("isJpeg", info.is_jpeg);
+    j.bool_field("progressive", info.progressive);
+    j.num_field("width", info.width as f64);
+    j.num_field("height", info.height as f64);
+    j.num_field("precision", info.precision as f64);
+    j.num_field("components", info.components as f64);
+    j.num_field("restartInterval", info.restart_interval as f64);
+    j.num_field("fileLength", file_len as f64);
+    let h_s = info.h_samp[0].max(1);
+    let _v = info.v_samp[0].max(1);
+    let ch = info.h_samp[1].max(1);
+    let _cv = info.v_samp[1].max(1);
+    let sub = if info.components >= 3 {
+        format!("{}:{}:{}", h_s / ch.max(1), h_s / ch.max(1), h_s / ch.max(1))
+    } else {
+        "1:1:1".into()
+    };
+    // Standard 4:2:0 / 4:2:2 labels
+    let chroma = if info.components < 3 {
+        "grayscale"
+    } else if info.h_samp[0] == 2 && info.v_samp[0] == 2 && info.h_samp[1] == 1 && info.v_samp[1] == 1
+    {
+        "4:2:0"
+    } else if info.h_samp[0] == 2 && info.v_samp[0] == 1 && info.h_samp[1] == 1 && info.v_samp[1] == 1
+    {
+        "4:2:2"
+    } else if info.h_samp[0] == 1 && info.v_samp[0] == 1 {
+        "4:4:4"
+    } else {
+        "custom"
+    };
+    j.str_field("chromaSubsampling", chroma);
+    j.str_field("samplingHint", &sub);
+    if let Some((_, table)) = info.qtables.first() {
+        j.num_field("estimatedQuality", estimate_quality(table));
+    }
+    j.key("quantizationTables");
+    j.begin_arr();
+    for (id, table) in &info.qtables {
+        j.begin_obj();
+        j.num_field("id", *id as f64);
+        let sum: u32 = table.iter().map(|x| *x as u32).sum();
+        j.num_field("sum", sum as f64);
+        j.num_field("dc", table[0] as f64);
+        j.key("values");
+        j.begin_arr();
+        for (i, v) in table.iter().enumerate() {
+            j.num(*v as f64);
+            if i + 1 < 64 {
+                j.comma();
+            }
+        }
+        j.end_arr();
+        j.end_obj();
+        j.comma();
+    }
+    j.end_arr();
+    j.key("markers");
+    j.begin_arr();
+    for (i, m) in info.markers.iter().enumerate() {
+        j.begin_obj();
+        j.str_field("name", &m.name);
+        j.num_field("offset", m.offset as f64);
+        j.num_field("length", m.length as f64);
+        j.end_obj();
+        if i + 1 < info.markers.len() {
+            j.comma();
+        }
+    }
+    j.end_arr();
+    j.key("comments");
+    j.begin_arr();
+    for (i, c) in info.comments.iter().enumerate() {
+        j.str(c);
+        if i + 1 < info.comments.len() {
+            j.comma();
+        }
+    }
+    j.end_arr();
+    j.bool_field("hasThumbnail", info.thumbnail.is_some());
+    j.num_field("app1Count", info.app1.len() as f64);
+    if let Some(a) = info.app1.first() {
+        j.str_field("app1Head", &hex_preview(a, 24));
+        if a.starts_with(b"Exif") {
+            j.str_field("app1Kind", "Exif");
+        } else if a.windows(4).any(|w| w == b"http" || w == b"<xmp" || w == b"<?xm") {
+            j.str_field("app1Kind", "XMP");
+        } else {
+            j.str_field("app1Kind", "APP1");
+        }
+    }
+    j.end_obj();
+    j.into_string()
+}
+
+/// Estimate a JPEG quality factor from the first luminance Q table (standard IJG).
+pub fn estimate_quality(table: &[u16; 64]) -> f64 {
+    // Mean of AC coefficients relative to a typical Q=50 table is noisy;
+    // use the classic "sum of table" heuristic.
+    let sum: f64 = table.iter().map(|x| *x as f64).sum();
+    // IJG quality 50 luminance sum is 217. Scale empirically.
+    let q = 100.0 - (sum - 64.0) / 14.0;
+    q.clamp(1.0, 100.0)
+}
+
+
+// ===== src/json.rs =====
+//! Tiny JSON writer — avoids serde to keep the wasm binary small.
+
+pub struct Json {
+    buf: String,
+}
+
+impl Json {
+    pub fn new() -> Self {
+        Self {
+            buf: String::with_capacity(4096),
+        }
+    }
+
+    pub fn into_string(self) -> String {
+        let mut s = self.buf;
+        if s.ends_with(',') {
+            s.pop();
+        }
+        s
+    }
+
+    pub fn begin_obj(&mut self) {
+        self.buf.push('{');
+    }
+    pub fn end_obj(&mut self) {
+        self.trim_comma();
+        self.buf.push('}');
+        self.buf.push(',');
+    }
+    pub fn begin_arr(&mut self) {
+        self.buf.push('[');
+    }
+    pub fn end_arr(&mut self) {
+        self.trim_comma();
+        self.buf.push(']');
+        self.buf.push(',');
+    }
+    pub fn comma(&mut self) {
+        if !self.buf.ends_with(',') {
+            self.buf.push(',');
+        }
+    }
+    fn trim_comma(&mut self) {
+        if self.buf.ends_with(',') {
+            self.buf.pop();
+        }
+    }
+    pub fn key(&mut self, k: &str) {
+        self.str(k);
+        self.buf.push(':');
+    }
+    pub fn str(&mut self, s: &str) {
+        self.buf.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => self.buf.push_str("\\\""),
+                '\\' => self.buf.push_str("\\\\"),
+                '\n' => self.buf.push_str("\\n"),
+                '\r' => self.buf.push_str("\\r"),
+                '\t' => self.buf.push_str("\\t"),
+                c if (c as u32) < 0x20 => self.buf.push_str(&format!("\\u{:04x}", c as u32)),
+                c => self.buf.push(c),
+            }
+        }
+        self.buf.push('"');
+    }
+    pub fn num(&mut self, n: f64) {
+        if !n.is_finite() {
+            self.buf.push_str("0");
+        } else if n.fract() == 0.0 && n.abs() < 1e15 {
+            self.buf.push_str(&format!("{}", n as i64));
+        } else {
+            self.buf.push_str(&format!("{:.6}", n));
+        }
+    }
+    pub fn bool(&mut self, b: bool) {
+        self.buf.push_str(if b { "true" } else { "false" });
+    }
+    pub fn str_field(&mut self, k: &str, v: &str) {
+        self.key(k);
+        self.str(v);
+        self.buf.push(',');
+    }
+    pub fn num_field(&mut self, k: &str, v: f64) {
+        self.key(k);
+        self.num(v);
+        self.buf.push(',');
+    }
+    pub fn bool_field(&mut self, k: &str, v: bool) {
+        self.key(k);
+        self.bool(v);
+        self.buf.push(',');
+    }
+}
+
+pub fn hex_preview(b: &[u8], n: usize) -> String {
+    b.iter()
+        .take(n)
+        .map(|x| format!("{:02X}", x))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+
+// ===== src/lib.rs =====
+//! Tracebench forensic engine — wasm32 C ABI + native tests.
+//!
+//! All image bytes stay in-process. The original buffer is never mutated.
+
+mod clone;
+mod dct;
+mod ela;
+mod jpeg;
+mod json;
+mod spatial;
+mod stats;
+
+use std::cell::RefCell;
+
+use crate::stats::Stats;
+
+pub const VERSION: &str = "1.0.0";
+pub const ENGINE_ID: &str = "tracebench-forensic-engine";
+
+const DEFAULT_MAX_PIXELS: u32 = 16_000_000;
+const DEFAULT_MAX_DIM: u32 = 8192;
+const DEFAULT_MAX_FILE: u32 = 48 * 1024 * 1024;
+
+#[derive(Default)]
+struct Session {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    file: Vec<u8>,
+    luma: Vec<f32>,
+    max_pixels: u32,
+    max_dim: u32,
+    max_file: u32,
+    last_json: Vec<u8>,
+    last_error: Vec<u8>,
+    thumbnail: Vec<u8>,
+}
+
+impl Session {
+    fn set_error(&mut self, msg: &str) {
+        let mut b = msg.as_bytes().to_vec();
+        b.push(0);
+        self.last_error = b;
+    }
+    fn set_json(&mut self, s: String) -> u32 {
+        let mut b = s.into_bytes();
+        b.push(0);
+        let ptr = b.as_ptr() as u32;
+        self.last_json = b;
+        ptr
+    }
+}
+
+thread_local! {
+    static SESSION: RefCell<Session> = RefCell::new(Session {
+        max_pixels: DEFAULT_MAX_PIXELS,
+        max_dim: DEFAULT_MAX_DIM,
+        max_file: DEFAULT_MAX_FILE,
+        ..Session::default()
+    });
+}
+
+fn with_session<T>(f: impl FnOnce(&mut Session) -> T) -> T {
+    SESSION.with(|s| f(&mut s.borrow_mut()))
+}
+
+#[no_mangle]
+pub extern "C" fn tb_version() -> u32 {
+    static V: &str = "1.0.0\0";
+    V.as_ptr() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn tb_engine_id() -> u32 {
+    static V: &str = "tracebench-forensic-engine\0";
+    V.as_ptr() as u32
+}
+
+/// Allocate `size` bytes, 8-byte aligned. Pair with tb_free.
+#[no_mangle]
+pub extern "C" fn tb_alloc(size: u32) -> u32 {
+    if size == 0 || size > 512 * 1024 * 1024 {
+        return 0;
+    }
+    let mut v = vec![0u8; size as usize];
+    let ptr = v.as_mut_ptr() as u32;
+    std::mem::forget(v);
+    ptr
+}
+
+#[no_mangle]
+pub extern "C" fn tb_free(ptr: u32, size: u32) {
+    if ptr == 0 || size == 0 {
+        return;
+    }
+    unsafe {
+        let _ = Vec::from_raw_parts(ptr as *mut u8, size as usize, size as usize);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn tb_set_limits(max_pixels: u32, max_dim: u32, max_file: u32) {
+    with_session(|s| {
+        if max_pixels > 0 {
+            s.max_pixels = max_pixels;
+        }
+        if max_dim > 0 {
+            s.max_dim = max_dim;
+        }
+        if max_file > 0 {
+            s.max_file = max_file;
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn tb_set_image(ptr: u32, w: u32, h: u32) -> i32 {
+    with_session(|s| {
+        if w == 0 || h == 0 || w > s.max_dim || h > s.max_dim {
+            s.set_error("dimension limit");
+            return -5;
+        }
+        let n = match (w as usize).checked_mul(h as usize) {
+            Some(v) => v,
+            None => {
+                s.set_error("overflow");
+                return -5;
+            }
+        };
+        if n as u32 > s.max_pixels {
+            s.set_error("pixel limit");
+            return -5;
+        }
+        let bytes = n.saturating_mul(4);
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, bytes) };
+        s.width = w;
+        s.height = h;
+        s.rgba = slice.to_vec();
+        s.luma = spatial::to_luma(&s.rgba, w, h);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_set_file(ptr: u32, len: u32) -> i32 {
+    with_session(|s| {
+        if len > s.max_file {
+            s.set_error("file size limit");
+            return -5;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+        s.file = slice.to_vec();
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_width() -> u32 {
+    with_session(|s| s.width)
+}
+#[no_mangle]
+pub extern "C" fn tb_height() -> u32 {
+    with_session(|s| s.height)
+}
+
+#[no_mangle]
+pub extern "C" fn tb_last_error() -> u32 {
+    with_session(|s| {
+        if s.last_error.is_empty() {
+            0
+        } else {
+            s.last_error.as_ptr() as u32
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_last_json() -> u32 {
+    with_session(|s| {
+        if s.last_json.is_empty() {
+            0
+        } else {
+            s.last_json.as_ptr() as u32
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_last_json_len() -> u32 {
+    with_session(|s| s.last_json.len().saturating_sub(1) as u32)
+}
+
+fn write_stats(ptr: u32, st: &Stats) {
+    if ptr == 0 {
+        return;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f64, 10) };
+    st.write_f64(out);
+}
+
+fn map_out<'a>(s: &'a Session, ptr: u32) -> Option<&'a mut [u8]> {
+    if ptr == 0 || s.width == 0 {
+        return None;
+    }
+    let n = (s.width as usize) * (s.height as usize);
+    Some(unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, n) })
+}
+
+/// quality 1-100, gain*100 (e.g. 1200 = 12.0), percentile*100 (9800 = 98)
+#[no_mangle]
+pub extern "C" fn tb_ela(quality: u32, gain_x100: u32, percentile_x100: u32, out_ptr: u32, stats_ptr: u32) -> i32 {
+    with_session(|s| {
+        if s.rgba.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        // PNG / non-JPEG: still run (re-encode from pixels) but JSON notes inappropriateness.
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => {
+                s.set_error("out");
+                return -2;
+            }
+        };
+        let params = ela::ElaParams {
+            quality: quality.clamp(1, 100) as u8,
+            gain: gain_x100 as f32 / 100.0,
+            percentile: percentile_x100 as f32 / 100.0,
+        };
+        match ela::error_level(&s.rgba, s.width, s.height, params, out) {
+            Ok(st) => {
+                write_stats(stats_ptr, &st);
+                let jpeg = s.file.len() >= 3 && s.file[0] == 0xff && s.file[1] == 0xd8;
+                let note = if jpeg {
+                    "ELA residual after JPEG re-encode. High error can indicate locally different compression history — not proof of editing."
+                } else {
+                    "ELA is designed for JPEG. This file does not appear to be JPEG; residual mainly reflects the encoder's first-time quantization and is easy to misread."
+                };
+                s.set_json(format!(
+                    "{{\"appropriate\":{},\"quality\":{},\"note\":\"{}\"}}",
+                    jpeg, params.quality, note
+                ));
+                0
+            }
+            Err(e) => {
+                s.set_error(e);
+                -3
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_noise(
+    method: u32,
+    window: u32,
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::noise_map(
+            &s.luma,
+            s.width,
+            s.height,
+            method,
+            window,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_edge(
+    method: u32,
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::edge_map(
+            &s.luma,
+            s.width,
+            s.height,
+            method,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_sharpness(
+    window: u32,
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::sharpness_map(
+            &s.luma,
+            s.width,
+            s.height,
+            window,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_color(gain_x100: u32, percentile_x100: u32, out_ptr: u32, stats_ptr: u32) -> i32 {
+    with_session(|s| {
+        if s.rgba.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::color_anomaly_map(
+            &s.rgba,
+            s.width,
+            s.height,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_cfa(gain_x100: u32, percentile_x100: u32, out_ptr: u32, stats_ptr: u32) -> i32 {
+    with_session(|s| {
+        if s.rgba.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::cfa_map(
+            &s.rgba,
+            s.width,
+            s.height,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        s.set_json("{\"experimental\":true,\"note\":\"CFA/demosaic residuals are camera-pipeline dependent. Absence or presence is not attribution.\"}".into());
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_resample(
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::resample_map(
+            &s.luma,
+            s.width,
+            s.height,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_frequency(
+    band: u32,
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = dct::frequency_map(
+            &s.luma,
+            s.width,
+            s.height,
+            band,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_double_jpeg(
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let (st, score) = dct::double_jpeg_map(
+            &s.luma,
+            s.width,
+            s.height,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        s.set_json(format!(
+            "{{\"periodicityScore\":{:.6},\"note\":\"Histogram periodicity can arise from aligned recompression, transcoding, or camera JPEG engines. It does not by itself prove content editing.\"}}",
+            score
+        ));
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_clone(
+    block: u32,
+    stride: u32,
+    threshold: u32,
+    min_region: u32,
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let result = clone::copy_move(
+            &s.luma,
+            s.width,
+            s.height,
+            block,
+            stride,
+            threshold,
+            min_region,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &result.stats);
+        s.set_json(result.json);
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_prnu_residual(
+    gain_x100: u32,
+    percentile_x100: u32,
+    out_ptr: u32,
+    stats_ptr: u32,
+) -> i32 {
+    // Without a reference set this is a noise residual, not a camera fingerprint.
+    with_session(|s| {
+        if s.luma.is_empty() {
+            s.set_error("no image");
+            return -1;
+        }
+        let out = match map_out(s, out_ptr) {
+            Some(o) => o,
+            None => return -2,
+        };
+        let st = spatial::noise_map(
+            &s.luma,
+            s.width,
+            s.height,
+            4,
+            5,
+            gain_x100 as f32 / 100.0,
+            percentile_x100 as f32 / 100.0,
+            out,
+        );
+        write_stats(stats_ptr, &st);
+        s.set_json("{\"experimental\":true,\"referenceSet\":false,\"note\":\"PRNU attribution requires a camera reference set. This map is a wavelet-like median residual only.\"}".into());
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_jpeg_json() -> u32 {
+    with_session(|s| {
+        let info = jpeg::parse_jpeg(&s.file);
+        if let Some(t) = info.thumbnail.clone() {
+            s.thumbnail = t;
+        }
+        let js = jpeg::jpeg_to_json(&info, s.file.len());
+        s.set_json(js)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_thumbnail_ptr() -> u32 {
+    with_session(|s| {
+        if s.thumbnail.is_empty() {
+            0
+        } else {
+            s.thumbnail.as_ptr() as u32
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn tb_thumbnail_len() -> u32 {
+    with_session(|s| s.thumbnail.len() as u32)
+}
+
+/// Region stats on luminance: x,y,w,h
+#[no_mangle]
+pub extern "C" fn tb_region_luma_stats(x: u32, y: u32, rw: u32, rh: u32, stats_ptr: u32) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() {
+            return -1;
+        }
+        let w = s.width as usize;
+        let h = s.height as usize;
+        let x0 = x.min(s.width) as usize;
+        let y0 = y.min(s.height) as usize;
+        let x1 = (x + rw).min(s.width) as usize;
+        let y1 = (y + rh).min(s.height) as usize;
+        if x1 <= x0 || y1 <= y0 {
+            return -4;
+        }
+        let mut buf = Vec::with_capacity((x1 - x0) * (y1 - y0));
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                buf.push(s.luma[yy * w + xx]);
+            }
+        }
+        let st = stats::stats_f32(&buf);
+        write_stats(stats_ptr, &st);
+        let _ = h;
+        0
+    })
+}
+
+/// Compare two rectangular ROIs on luma. Writes 20 f64 (A then B).
+#[no_mangle]
+pub extern "C" fn tb_region_compare(
+    ax: u32,
+    ay: u32,
+    aw: u32,
+    ah: u32,
+    bx: u32,
+    by: u32,
+    bw: u32,
+    bh: u32,
+    stats_ptr: u32,
+) -> i32 {
+    with_session(|s| {
+        if s.luma.is_empty() || stats_ptr == 0 {
+            return -1;
+        }
+        let grab = |x: u32, y: u32, rw: u32, rh: u32| -> Vec<f32> {
+            let x0 = x.min(s.width) as usize;
+            let y0 = y.min(s.height) as usize;
+            let x1 = (x + rw).min(s.width) as usize;
+            let y1 = (y + rh).min(s.height) as usize;
+            let mut buf = Vec::new();
+            let w = s.width as usize;
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    buf.push(s.luma[yy * w + xx]);
+                }
+            }
+            buf
+        };
+        let a = stats::stats_f32(&grab(ax, ay, aw, ah));
+        let b = stats::stats_f32(&grab(bx, by, bw, bh));
+        let out = unsafe { std::slice::from_raw_parts_mut(stats_ptr as *mut f64, 20) };
+        a.write_f64(&mut out[0..10]);
+        b.write_f64(&mut out[10..20]);
+        0
+    })
+}
+
+pub fn parse_jpeg_bytes(bytes: &[u8]) -> jpeg::JpegInfo {
+    jpeg::parse_jpeg(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray_rgba(w: u32, h: u32, v: u8) -> Vec<u8> {
+        let n = (w * h) as usize;
+        let mut out = vec![0u8; n * 4];
+        for i in 0..n {
+            out[i * 4] = v;
+            out[i * 4 + 1] = v;
+            out[i * 4 + 2] = v;
+            out[i * 4 + 3] = 255;
+        }
+        out
+    }
+
+    #[test]
+    fn ela_uniform_is_low() {
+        let w = 64u32;
+        let h = 64u32;
+        let rgba = gray_rgba(w, h, 128);
+        let mut out = vec![0u8; (w * h) as usize];
+        let st = ela::error_level(
+            &rgba,
+            w,
+            h,
+            ela::ElaParams {
+                quality: 90,
+                gain: 1.0,
+                percentile: 99.0,
+            },
+            &mut out,
+        )
+        .unwrap();
+        // Uniform field recompresses cleanly; mean residual should be small.
+        assert!(st.mean < 8.0, "mean {}", st.mean);
+    }
+
+    #[test]
+    fn jpeg_soi() {
+        let bytes = [0xff, 0xd8, 0xff, 0xd9];
+        let info = jpeg::parse_jpeg(&bytes);
+        assert!(info.is_jpeg);
+    }
+
+    #[test]
+    fn noise_variance_higher_on_noise() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut y = vec![128.0f32; (w * h) as usize];
+        let mut out = vec![0u8; y.len()];
+        let st0 = spatial::noise_map(&y, w, h, 1, 5, 1.0, 99.0, &mut out);
+        for i in 0..y.len() {
+            y[i] = (i % 17) as f32 * 8.0;
+        }
+        let st1 = spatial::noise_map(&y, w, h, 1, 5, 1.0, 99.0, &mut out);
+        assert!(st1.mean > st0.mean);
+    }
+
+    #[test]
+    fn clone_finds_pasted_block() {
+        let w = 96u32;
+        let h = 96u32;
+        let mut y = vec![0f32; (w * h) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                y[(yy * w + xx) as usize] = ((xx * 13 + yy * 7) % 255) as f32;
+            }
+        }
+        // Copy 24x24 from (8,8) to (56,56)
+        for j in 0..24 {
+            for i in 0..24 {
+                let src = ((8 + j) * w + (8 + i)) as usize;
+                let dst = ((56 + j) * w + (56 + i)) as usize;
+                y[dst] = y[src];
+            }
+        }
+        let mut out = vec![0u8; y.len()];
+        let r = clone::copy_move(&y, w, h, 16, 8, 40, 3, 4.0, 99.0, &mut out);
+        assert!(
+            r.json.contains("potential") || r.stats.max > 0.0,
+            "{}",
+            r.json
+        );
+    }
+
+    #[test]
+    fn stats_constant() {
+        let data = vec![3.0f32; 100];
+        let st = stats::stats_f32(&data);
+        assert!((st.mean - 3.0).abs() < 1e-6);
+        assert!(st.std.abs() < 1e-6);
+        assert!((st.median - 3.0).abs() < 1e-6);
+    }
+}
+
+
+// ===== src/spatial.rs =====
+//! Spatial detectors: noise, edges, sharpness, color, CFA, resampling.
+
+use crate::stats::{luma, scale_to_u8, Stats};
+
+pub fn to_luma(rgba: &[u8], w: u32, h: u32) -> Vec<f32> {
+    let n = (w as usize) * (h as usize);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        y.push(luma(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]));
+    }
+    y
+}
+
+fn clamp_i(v: i32, max: i32) -> i32 {
+    v.clamp(0, max)
+}
+
+/// Box-filter residual (high-pass), local variance, Laplacian, median, multi-scale.
+/// method: 0 hp, 1 var, 2 std, 3 lap, 4 median, 5 multiscale
+pub fn noise_map(
+    y: &[f32],
+    w: u32,
+    h: u32,
+    method: u32,
+    window: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut r = vec![0f32; n];
+    let radius = ((window.max(3) as usize) / 2).min(15);
+
+    match method {
+        1 | 2 => {
+            // Integral images for O(1) window variance
+            let mut sum = vec![0f64; (w + 1) * (h + 1)];
+            let mut sq = vec![0f64; (w + 1) * (h + 1)];
+            for yy in 0..h {
+                let mut rs = 0.0;
+                let mut rq = 0.0;
+                for xx in 0..w {
+                    let v = y[yy * w + xx] as f64;
+                    rs += v;
+                    rq += v * v;
+                    let i = (yy + 1) * (w + 1) + (xx + 1);
+                    sum[i] = sum[yy * (w + 1) + (xx + 1)] + rs;
+                    sq[i] = sq[yy * (w + 1) + (xx + 1)] + rq;
+                }
+            }
+            let rect = |int: &[f64], x0: i32, y0: i32, x1: i32, y1: i32| -> f64 {
+                let idx = |x: i32, y: i32| (y.max(0) as usize) * (w + 1) + (x.max(0) as usize);
+                int[idx(x1, y1)] + int[idx(x0, y0)] - int[idx(x1, y0)] - int[idx(x0, y1)]
+            };
+            for yy in 0..h {
+                for xx in 0..w {
+                    let x0 = xx as i32 - radius as i32;
+                    let y0 = yy as i32 - radius as i32;
+                    let x1 = (xx as i32 + radius as i32 + 1).min(w as i32);
+                    let y1 = (yy as i32 + radius as i32 + 1).min(h as i32);
+                    let x0c = x0.max(0);
+                    let y0c = y0.max(0);
+                    let area = ((x1 - x0c) * (y1 - y0c)).max(1) as f64;
+                    let s = rect(&sum, x0c, y0c, x1, y1);
+                    let q = rect(&sq, x0c, y0c, x1, y1);
+                    let mean = s / area;
+                    let var = (q / area - mean * mean).max(0.0);
+                    r[yy * w + xx] = if method == 2 {
+                        var.sqrt() as f32
+                    } else {
+                        var as f32
+                    };
+                }
+            }
+        }
+        3 => {
+            // Laplacian residual (4-neighbour)
+            for yy in 0..h {
+                for xx in 0..w {
+                    let c = y[yy * w + xx];
+                    let l = y[yy * w + xx.saturating_sub(1)];
+                    let ri = y[yy * w + (xx + 1).min(w - 1)];
+                    let u = y[yy.saturating_sub(1) * w + xx];
+                    let d = y[(yy + 1).min(h - 1) * w + xx];
+                    r[yy * w + xx] = (4.0 * c - l - ri - u - d).abs();
+                }
+            }
+        }
+        4 => {
+            // 3x3 median residual
+            let mut win = [0f32; 9];
+            for yy in 0..h {
+                for xx in 0..w {
+                    let mut k = 0;
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let x = clamp_i(xx as i32 + dx, w as i32 - 1) as usize;
+                            let yv = clamp_i(yy as i32 + dy, h as i32 - 1) as usize;
+                            win[k] = y[yv * w + x];
+                            k += 1;
+                        }
+                    }
+                    win.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    r[yy * w + xx] = (y[yy * w + xx] - win[4]).abs();
+                }
+            }
+        }
+        5 => {
+            // Multi-scale: |y - box3| + |y - box7|
+            let hp = |rad: usize, dst: &mut [f32]| {
+                for yy in 0..h {
+                    for xx in 0..w {
+                        let mut s = 0.0;
+                        let mut c = 0.0;
+                        let y0 = yy.saturating_sub(rad);
+                        let y1 = (yy + rad).min(h - 1);
+                        let x0 = xx.saturating_sub(rad);
+                        let x1 = (xx + rad).min(w - 1);
+                        for yv in y0..=y1 {
+                            for x in x0..=x1 {
+                                s += y[yv * w + x];
+                                c += 1.0;
+                            }
+                        }
+                        dst[yy * w + xx] = (y[yy * w + xx] - s / c).abs();
+                    }
+                }
+            };
+            let mut a = vec![0f32; n];
+            let mut b = vec![0f32; n];
+            hp(1, &mut a);
+            hp(3, &mut b);
+            for i in 0..n {
+                r[i] = a[i] + 0.5 * b[i];
+            }
+        }
+        _ => {
+            // High-pass vs box mean
+            for yy in 0..h {
+                for xx in 0..w {
+                    let mut s = 0.0;
+                    let mut c = 0.0;
+                    let y0 = yy.saturating_sub(radius);
+                    let y1 = (yy + radius).min(h - 1);
+                    let x0 = xx.saturating_sub(radius);
+                    let x1 = (xx + radius).min(w - 1);
+                    for yv in y0..=y1 {
+                        for x in x0..=x1 {
+                            s += y[yv * w + x];
+                            c += 1.0;
+                        }
+                    }
+                    r[yy * w + xx] = (y[yy * w + xx] - s / c).abs();
+                }
+            }
+        }
+    }
+    scale_to_u8(&r, out, gain, percentile)
+}
+
+/// method: 0 Sobel, 1 Scharr, 2 Laplacian, 3 Canny-like (sobel + thin)
+pub fn edge_map(
+    y: &[f32],
+    w: u32,
+    h: u32,
+    method: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut mag = vec![0f32; n];
+    let mut gx = vec![0f32; n];
+    let mut gy = vec![0f32; n];
+
+    let (kx, ky): ([f32; 9], [f32; 9]) = if method == 1 {
+        (
+            [-3.0, 0.0, 3.0, -10.0, 0.0, 10.0, -3.0, 0.0, 3.0],
+            [-3.0, -10.0, -3.0, 0.0, 0.0, 0.0, 3.0, 10.0, 3.0],
+        )
+    } else {
+        (
+            [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0],
+            [-1.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0],
+        )
+    };
+
+    if method == 2 {
+        for yy in 1..h - 1 {
+            for xx in 1..w - 1 {
+                let c = y[yy * w + xx];
+                mag[yy * w + xx] = (4.0 * c
+                    - y[yy * w + xx - 1]
+                    - y[yy * w + xx + 1]
+                    - y[(yy - 1) * w + xx]
+                    - y[(yy + 1) * w + xx])
+                    .abs();
+            }
+        }
+        return scale_to_u8(&mag, out, gain, percentile);
+    }
+
+    for yy in 1..h - 1 {
+        for xx in 1..w - 1 {
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+            let mut k = 0;
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let v = y[(yy + dy - 1) * w + (xx + dx - 1)];
+                    sx += v * kx[k];
+                    sy += v * ky[k];
+                    k += 1;
+                }
+            }
+            gx[yy * w + xx] = sx;
+            gy[yy * w + xx] = sy;
+            mag[yy * w + xx] = (sx * sx + sy * sy).sqrt();
+        }
+    }
+
+    if method == 3 {
+        // Non-maximum suppression + simple hysteresis-ish keep
+        let mut thin = vec![0f32; n];
+        for yy in 1..h - 1 {
+            for xx in 1..w - 1 {
+                let i = yy * w + xx;
+                let m = mag[i];
+                let ax = gx[i].abs();
+                let ay = gy[i].abs();
+                let (n1, n2) = if ax > ay {
+                    (mag[i - 1], mag[i + 1])
+                } else {
+                    (mag[i - w], mag[i + w])
+                };
+                if m >= n1 && m >= n2 {
+                    thin[i] = m;
+                }
+            }
+        }
+        mag = thin;
+    }
+    scale_to_u8(&mag, out, gain, percentile)
+}
+
+/// Variance of Laplacian + gradient energy mix.
+pub fn sharpness_map(
+    y: &[f32],
+    w: u32,
+    h: u32,
+    window: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut lap = vec![0f32; n];
+    for yy in 1..h - 1 {
+        for xx in 1..w - 1 {
+            let c = y[yy * w + xx];
+            lap[yy * w + xx] = 4.0 * c
+                - y[yy * w + xx - 1]
+                - y[yy * w + xx + 1]
+                - y[(yy - 1) * w + xx]
+                - y[(yy + 1) * w + xx];
+        }
+    }
+    let radius = ((window.max(5) as usize) / 2).min(11);
+    let mut r = vec![0f32; n];
+    for yy in 0..h {
+        for xx in 0..w {
+            let mut s = 0.0;
+            let mut sq = 0.0;
+            let mut g = 0.0;
+            let mut c = 0.0;
+            let y0 = yy.saturating_sub(radius);
+            let y1 = (yy + radius).min(h - 1);
+            let x0 = xx.saturating_sub(radius);
+            let x1 = (xx + radius).min(w - 1);
+            for yv in y0..=y1 {
+                for x in x0..=x1 {
+                    let v = lap[yv * w + x];
+                    s += v;
+                    sq += v * v;
+                    if x + 1 <= x1 {
+                        let dx = y[yv * w + x] - y[yv * w + (x + 1).min(w - 1)];
+                        g += dx * dx;
+                    }
+                    c += 1.0;
+                }
+            }
+            let mean = s / c;
+            let var = (sq / c - mean * mean).max(0.0);
+            r[yy * w + xx] = var + 0.15 * (g / c);
+        }
+    }
+    scale_to_u8(&r, out, gain, percentile)
+}
+
+/// Color discontinuity: chroma gradient vs luma gradient (Lab-ish a,b via simple opponent).
+pub fn color_anomaly_map(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    gain: f32,
+    percentile: f32,
+    out: &mut [u8],
+) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut a = vec![0f32; n];
+    let mut b = vec![0f32; n];
+    let mut y = vec![0f32; n];
+    for i in 0..n {
+        let r = rgba[i * 4] as f32;
+        let g = rgba[i * 4 + 1] as f32;
+        let bl = rgba[i * 4 + 2] as f32;
+        y[i] = luma(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+        a[i] = r - g;
+        b[i] = 0.5 * (r + g) - bl;
+    }
+    let mut rmap = vec![0f32; n];
+    for yy in 1..h - 1 {
+        for xx in 1..w - 1 {
+            let i = yy * w + xx;
+            let gy = (y[i + 1] - y[i - 1]).abs() + (y[i + w] - y[i - w]).abs();
+            let ga = (a[i + 1] - a[i - 1]).abs() + (a[i + w] - a[i - w]).abs();
+            let gb = (b[i + 1] - b[i - 1]).abs() + (b[i + w] - b[i - w]).abs();
+            let chroma = ga + gb;
+            rmap[i] = (chroma - 0.85 * gy).max(0.0);
+        }
+    }
+    scale_to_u8(&rmap, out, gain, percentile)
+}
+
+/// Experimental CFA / demosaic residual: 2x2 period energy.
+pub fn cfa_map(rgba: &[u8], w: u32, h: u32, gain: f32, percentile: f32, out: &mut [u8]) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut green = vec![0f32; n];
+    for i in 0..n {
+        green[i] = rgba[i * 4 + 1] as f32;
+    }
+    let mut r = vec![0f32; n];
+    for yy in 2..h - 2 {
+        for xx in 2..w - 2 {
+            // High-pass then 2x2 checker correlation
+            let c = green[yy * w + xx];
+            let hp = c
+                - 0.25
+                    * (green[yy * w + xx - 1]
+                        + green[yy * w + xx + 1]
+                        + green[(yy - 1) * w + xx]
+                        + green[(yy + 1) * w + xx]);
+            let even = ((xx + yy) & 1) as f32 * 2.0 - 1.0;
+            r[yy * w + xx] = (hp * even).abs();
+        }
+    }
+    scale_to_u8(&r, out, gain, percentile)
+}
+
+/// Gallagher-style resampling: second derivative periodicity along rows/cols.
+pub fn resample_map(y: &[f32], w: u32, h: u32, gain: f32, percentile: f32, out: &mut [u8]) -> Stats {
+    let w = w as usize;
+    let h = h as usize;
+    let n = w * h;
+    let mut d2 = vec![0f32; n];
+    for yy in 0..h {
+        for xx in 1..w - 1 {
+            let i = yy * w + xx;
+            d2[i] = (y[i - 1] - 2.0 * y[i] + y[i + 1]).abs();
+        }
+    }
+    // Local periodicity energy: compare even vs odd lag-2 difference
+    let mut r = vec![0f32; n];
+    for yy in 2..h - 2 {
+        for xx in 4..w - 4 {
+            let i = yy * w + xx;
+            let mut even = 0.0;
+            let mut odd = 0.0;
+            for k in 0..8 {
+                let v = d2[i - 4 + k];
+                if k % 2 == 0 {
+                    even += v;
+                } else {
+                    odd += v;
+                }
+            }
+            r[i] = (even - odd).abs();
+        }
+    }
+    scale_to_u8(&r, out, gain, percentile)
+}
+
+
+// ===== src/stats.rs =====
+//! Descriptive statistics for residual / heatmap buffers.
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub mean: f64,
+    pub median: f64,
+    pub std: f64,
+    pub min: f64,
+    pub max: f64,
+    pub p05: f64,
+    pub p95: f64,
+    pub p99: f64,
+    pub energy: f64,
+    pub entropy: f64,
+}
+
+impl Stats {
+    pub fn write_f64(&self, out: &mut [f64]) {
+        if out.len() < 10 {
+            return;
+        }
+        out[0] = self.mean;
+        out[1] = self.median;
+        out[2] = self.std;
+        out[3] = self.min;
+        out[4] = self.max;
+        out[5] = self.p05;
+        out[6] = self.p95;
+        out[7] = self.p99;
+        out[8] = self.energy;
+        out[9] = self.entropy;
+    }
+}
+
+pub fn stats_f32(data: &[f32]) -> Stats {
+    if data.is_empty() {
+        return Stats::default();
+    }
+    let n = data.len() as f64;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut energy = 0.0f64;
+    for &v in data {
+        let x = if v.is_finite() { v } else { 0.0 };
+        if x < min {
+            min = x;
+        }
+        if x > max {
+            max = x;
+        }
+        let d = x as f64;
+        sum += d;
+        energy += d * d;
+    }
+    let mean = sum / n;
+    let mut var = 0.0f64;
+    for &v in data {
+        let x = if v.is_finite() { v as f64 } else { 0.0 };
+        let d = x - mean;
+        var += d * d;
+    }
+    let std = (var / n).sqrt();
+
+    let mut sorted: Vec<f32> = data
+        .iter()
+        .map(|v| if v.is_finite() { *v } else { 0.0 })
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let percentile = |p: f64| -> f64 {
+        let idx = ((p / 100.0) * (sorted.len().saturating_sub(1) as f64)).round() as usize;
+        sorted[idx.min(sorted.len() - 1)] as f64
+    };
+
+    // 64-bin entropy of normalized values
+    let range = (max - min).max(1e-8);
+    let mut bins = [0u32; 64];
+    for &v in data {
+        let x = if v.is_finite() { v } else { min };
+        let b = (((x - min) / range) * 63.0).floor() as usize;
+        bins[b.min(63)] += 1;
+    }
+    let mut entropy = 0.0f64;
+    for c in bins {
+        if c == 0 {
+            continue;
+        }
+        let p = c as f64 / n;
+        entropy -= p * p.log2();
+    }
+
+    Stats {
+        mean,
+        median: percentile(50.0),
+        std,
+        min: min as f64,
+        max: max as f64,
+        p05: percentile(5.0),
+        p95: percentile(95.0),
+        p99: percentile(99.0),
+        energy: energy / n,
+        entropy,
+    }
+}
+
+/// Percentile clip then linear scale to 0..255.
+pub fn scale_to_u8(src: &[f32], dst: &mut [u8], gain: f32, percentile: f32) -> Stats {
+    let stats = stats_f32(src);
+    if src.is_empty() || dst.is_empty() {
+        return stats;
+    }
+    let p = percentile.clamp(50.0, 100.0) as f64;
+    let mut sorted: Vec<f32> = src
+        .iter()
+        .map(|v| if v.is_finite() { *v } else { 0.0 })
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((p / 100.0) * (sorted.len().saturating_sub(1) as f64)).round() as usize;
+    let clip = sorted[idx.min(sorted.len() - 1)].max(1e-8);
+    let g = gain.max(0.01) as f32;
+    let n = src.len().min(dst.len());
+    for i in 0..n {
+        let v = src[i].max(0.0) / clip * 255.0 * g;
+        dst[i] = v.clamp(0.0, 255.0) as u8;
+    }
+    stats
+}
+
+pub fn luma(r: u8, g: u8, b: u8) -> f32 {
+    0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+}
+
+
+// ===== examples/bench.rs =====
+//! Native micro-benchmark for detector kernels.
+//! Run: cargo run -p forensic-engine --example bench --release
+
+use forensic_engine::*;
+use std::time::Instant;
+
+fn gray(w: u32, h: u32) -> Vec<u8> {
+    let n = (w * h) as usize;
+    let mut v = vec![0u8; n * 4];
+    for i in 0..n {
+        let t = ((i * 37) % 255) as u8;
+        v[i * 4] = t;
+        v[i * 4 + 1] = t.wrapping_add(3);
+        v[i * 4 + 2] = t.wrapping_add(7);
+        v[i * 4 + 3] = 255;
+    }
+    v
+}
+
+fn main() {
+    let w = 512u32;
+    let h = 512u32;
+    let rgba = gray(w, h);
+    let ptr = rgba.as_ptr() as u32;
+    // Native: just time parse + ela via public modules isn't C ABI safe for pointers.
+    // Time JPEG parse of a tiny buffer and luma conversion pattern.
+    let t0 = Instant::now();
+    let _ = parse_jpeg_bytes(&[0xff, 0xd8, 0xff, 0xd9]);
+    eprintln!("jpeg parse empty: {:?}", t0.elapsed());
+    eprintln!("bench image {}x{} ({} bytes rgba)", w, h, rgba.len());
+    let t1 = Instant::now();
+    let mut y = vec![0f32; (w * h) as usize];
+    for i in 0..(w * h) as usize {
+        y[i] = 0.2126 * rgba[i * 4] as f32
+            + 0.7152 * rgba[i * 4 + 1] as f32
+            + 0.0722 * rgba[i * 4 + 2] as f32;
+    }
+    eprintln!("luma: {:?}", t1.elapsed());
+    let _ = (ptr, VERSION, ENGINE_ID);
+}

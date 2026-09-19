@@ -1,0 +1,19 @@
+[package]
+name = "forensic-engine"
+version = "1.0.0"
+edition = "2021"
+authors = ["Tracebench"]
+description = "Local digital-image forensic detectors compiled to wasm32"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jpeg-decoder = { version = "0.3.2", default-features = false }
+jpeg-encoder = "0.6.1"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"

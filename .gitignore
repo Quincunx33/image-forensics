@@ -1,0 +1,32 @@
+# Dependencies and build output
+node_modules/
+target/
+dist/
+.cache/
+.vite/
+.tanstack/
+
+# Local/project metadata
+.project_id
+.node_modules.lock
+.grok/*
+!.grok/app-env.json
+
+# Uploaded or generated workspace material
+attachments/
+artifacts/
+screenshots/*
+!screenshots/.gitkeep
+
+# Archives and local logs
+*.log
+.DS_Store
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Editor/OS files
+.vscode/
+.idea/
