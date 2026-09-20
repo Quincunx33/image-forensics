@@ -196,39 +196,127 @@ function utf8(b: Uint8Array): string {
 const EXIF_TAGS: Record<number, string> = {
   0x0100: "ImageWidth",
   0x0101: "ImageLength",
+  0x0102: "BitsPerSample",
+  0x0103: "Compression",
+  0x0106: "PhotometricInterpretation",
+  0x010e: "ImageDescription",
   0x010f: "Make",
   0x0110: "Model",
+  0x0111: "StripOffsets",
   0x0112: "Orientation",
+  0x0115: "SamplesPerPixel",
+  0x0116: "RowsPerStrip",
+  0x0117: "StripByteCounts",
   0x011a: "XResolution",
   0x011b: "YResolution",
   0x0128: "ResolutionUnit",
   0x0131: "Software",
   0x0132: "DateTime",
   0x013b: "Artist",
+  0x0211: "YCbCrCoefficients",
+  0x0212: "YCbCrSubSampling",
   0x0213: "YCbCrPositioning",
+  0x0214: "ReferenceBlackWhite",
   0x8298: "Copyright",
   0x8769: "ExifIFD",
   0x8825: "GPSIFD",
   0x829a: "ExposureTime",
   0x829d: "FNumber",
   0x8822: "ExposureProgram",
+  0x8824: "SpectralSensitivity",
   0x8827: "ISO",
+  0x8830: "SensitivityType",
+  0x8832: "RecommendedExposureIndex",
   0x9000: "ExifVersion",
   0x9003: "DateTimeOriginal",
   0x9004: "DateTimeDigitized",
+  0x9010: "OffsetTime",
+  0x9011: "OffsetTimeOriginal",
+  0x9012: "OffsetTimeDigitized",
   0x9101: "ComponentsConfiguration",
+  0x9102: "CompressedBitsPerPixel",
   0x9201: "ShutterSpeedValue",
   0x9202: "ApertureValue",
+  0x9203: "BrightnessValue",
   0x9204: "ExposureBiasValue",
+  0x9205: "MaxApertureValue",
+  0x9206: "SubjectDistance",
   0x9207: "MeteringMode",
+  0x9208: "LightSource",
   0x9209: "Flash",
   0x920a: "FocalLength",
+  0x9214: "SubjectArea",
+  0x927c: "MakerNote",
+  0x9286: "UserComment",
+  0x9290: "SubSecTime",
+  0x9291: "SubSecTimeOriginal",
+  0x9292: "SubSecTimeDigitized",
+  0xa000: "FlashpixVersion",
   0xa001: "ColorSpace",
   0xa002: "PixelXDimension",
   0xa003: "PixelYDimension",
+  0xa004: "RelatedSoundFile",
+  0xa005: "InteroperabilityIFD",
+  0xa20e: "FocalPlaneXResolution",
+  0xa20f: "FocalPlaneYResolution",
+  0xa210: "FocalPlaneResolutionUnit",
+  0xa217: "SensingMethod",
+  0xa300: "FileSource",
+  0xa301: "SceneType",
+  0xa302: "CFAPattern",
+  0xa401: "CustomRendered",
+  0xa402: "ExposureMode",
+  0xa403: "WhiteBalance",
+  0xa404: "DigitalZoomRatio",
   0xa405: "FocalLengthIn35mm",
+  0xa406: "SceneCaptureType",
+  0xa407: "GainControl",
+  0xa408: "Contrast",
+  0xa409: "Saturation",
+  0xa40a: "Sharpness",
+  0xa40b: "DeviceSettingDescription",
+  0xa40c: "SubjectDistanceRange",
+  0xa420: "ImageUniqueID",
+  0xa430: "CameraOwnerName",
+  0xa431: "BodySerialNumber",
+  0xa432: "LensSpecification",
   0xa433: "LensMake",
   0xa434: "LensModel",
+  0xa435: "LensSerialNumber",
+};
+
+const GPS_TAGS: Record<number, string> = {
+  0x0000: "GPSVersionID",
+  0x0001: "GPSLatitudeRef",
+  0x0002: "GPSLatitude",
+  0x0003: "GPSLongitudeRef",
+  0x0004: "GPSLongitude",
+  0x0005: "GPSAltitudeRef",
+  0x0006: "GPSAltitude",
+  0x0007: "GPSTimeStamp",
+  0x0008: "GPSSatellites",
+  0x0009: "GPSStatus",
+  0x000a: "GPSMeasureMode",
+  0x000b: "GPSDOP",
+  0x000c: "GPSSpeedRef",
+  0x000d: "GPSSpeed",
+  0x000e: "GPSTrackRef",
+  0x000f: "GPSTrack",
+  0x0010: "GPSImgDirectionRef",
+  0x0011: "GPSImgDirection",
+  0x0012: "GPSMapDatum",
+  0x0013: "GPSDestLatitudeRef",
+  0x0014: "GPSDestLatitude",
+  0x0015: "GPSDestLongitudeRef",
+  0x0016: "GPSDestLongitude",
+  0x0017: "GPSDestBearingRef",
+  0x0018: "GPSDestBearing",
+  0x0019: "GPSDestDistanceRef",
+  0x001a: "GPSDestDistance",
+  0x001b: "GPSProcessingMethod",
+  0x001c: "GPSAreaInformation",
+  0x001d: "GPSDateStamp",
+  0x001e: "GPSDifferential",
 };
 
 export function extractExifThumbnail(app1: Uint8Array): Uint8Array | null {
@@ -284,7 +372,6 @@ function readExifFields(app1: Uint8Array, fields: MetaField[]) {
       const type = r16(e + 2);
       const count = r32(e + 4);
       const valOff = e + 8;
-      const name = EXIF_TAGS[tag];
       if (tag === 0x8769) {
         walk(r32(valOff), "Exif", depth + 1);
         continue;
@@ -293,7 +380,12 @@ function readExifFields(app1: Uint8Array, fields: MetaField[]) {
         walk(r32(valOff), "GPS", depth + 1);
         continue;
       }
-      if (!name) continue;
+      if (tag === 0xa005) {
+        walk(r32(valOff), "Interoperability", depth + 1);
+        continue;
+      }
+      const name = group === "GPS" ? GPS_TAGS[tag] : EXIF_TAGS[tag];
+      const fieldKey = name || `Tag_0x${tag.toString(16).padStart(4, "0").toUpperCase()}`;
       const unit = type === 3 ? 2 : type === 4 || type === 9 ? 4 : type === 5 || type === 10 ? 8 : 1;
       const size = unit * count;
       const dataPtr = size > 4 ? r32(valOff) : valOff;
@@ -303,24 +395,122 @@ function readExifFields(app1: Uint8Array, fields: MetaField[]) {
           const s = body.subarray(dataPtr, dataPtr + count);
           value = utf8(s).replace(/\0/g, "").trim();
         } else if (type === 3 && count === 1) {
-          value = String(r16(valOff));
+          const v16 = r16(valOff);
+          if (fieldKey === "Orientation") {
+            const map: Record<number, string> = {
+              1: "1 (Horizontal / Normal)",
+              2: "2 (Mirror horizontal)",
+              3: "3 (Rotate 180°)",
+              4: "4 (Mirror vertical)",
+              5: "5 (Mirror horizontal & Rotate 270° CW)",
+              6: "6 (Rotate 90° CW)",
+              7: "7 (Mirror horizontal & Rotate 90° CW)",
+              8: "8 (Rotate 270° CW)",
+            };
+            value = map[v16] ?? String(v16);
+          } else if (fieldKey === "ExposureProgram") {
+            const map: Record<number, string> = {
+              1: "Manual",
+              2: "Normal program",
+              3: "Aperture priority",
+              4: "Shutter priority",
+              5: "Creative program",
+              6: "Action program",
+              7: "Portrait mode",
+              8: "Landscape mode",
+            };
+            value = map[v16] ? `${v16} (${map[v16]})` : String(v16);
+          } else if (fieldKey === "MeteringMode") {
+            const map: Record<number, string> = {
+              1: "Average",
+              2: "Center-weighted average",
+              3: "Spot",
+              4: "Multi-spot",
+              5: "Multi-segment / Pattern",
+              6: "Partial",
+              255: "Other",
+            };
+            value = map[v16] ? `${v16} (${map[v16]})` : String(v16);
+          } else if (fieldKey === "Flash") {
+            const fired = (v16 & 1) !== 0;
+            const mode = (v16 >> 3) & 3;
+            const modeStr = mode === 1 ? "compulsory" : mode === 2 ? "suppressed" : mode === 3 ? "auto" : "standard";
+            value = `${v16} (${fired ? "Fired" : "Did not fire"}, ${modeStr})`;
+          } else if (fieldKey === "ColorSpace") {
+            value = v16 === 1 ? "1 (sRGB)" : v16 === 2 ? "2 (Adobe RGB)" : v16 === 65535 ? "Uncalibrated" : String(v16);
+          } else if (fieldKey === "ResolutionUnit") {
+            value = v16 === 2 ? "2 (inches)" : v16 === 3 ? "3 (cm)" : String(v16);
+          } else if (fieldKey === "WhiteBalance") {
+            value = v16 === 0 ? "0 (Auto)" : v16 === 1 ? "1 (Manual)" : String(v16);
+          } else {
+            value = String(v16);
+          }
         } else if ((type === 4 || type === 9) && count === 1) {
           value = String(r32(valOff));
-        } else if (type === 5 && count >= 1 && dataPtr + 8 <= body.length) {
-          const num = r32(dataPtr);
-          const den = r32(dataPtr + 4) || 1;
-          value = den === 1 ? String(num) : `${num}/${den}`;
-        } else if (type === 7 && count <= 8) {
-          value = [...body.subarray(dataPtr, dataPtr + count)]
-            .map((x) => String.fromCharCode(x))
-            .join("");
+        } else if ((type === 5 || type === 10) && count >= 1 && dataPtr + 8 * count <= body.length) {
+          if (group === "GPS" && (fieldKey === "GPSLatitude" || fieldKey === "GPSLongitude") && count === 3) {
+            const dN = r32(dataPtr);
+            const dD = r32(dataPtr + 4) || 1;
+            const mN = r32(dataPtr + 8);
+            const mD = r32(dataPtr + 12) || 1;
+            const sN = r32(dataPtr + 16);
+            const sD = r32(dataPtr + 20) || 1;
+            const deg = dN / dD;
+            const min = mN / mD;
+            const sec = sN / sD;
+            value = `${deg}° ${min}' ${sec.toFixed(2)}"`;
+          } else if (group === "GPS" && fieldKey === "GPSTimeStamp" && count === 3) {
+            const h = Math.floor(r32(dataPtr) / (r32(dataPtr + 4) || 1));
+            const m = Math.floor(r32(dataPtr + 8) / (r32(dataPtr + 12) || 1));
+            const s = (r32(dataPtr + 16) / (r32(dataPtr + 20) || 1)).toFixed(0);
+            value = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")} UTC`;
+          } else if (count === 1) {
+            const num = r32(dataPtr);
+            const den = r32(dataPtr + 4) || 1;
+            if (fieldKey === "ExposureTime") {
+              if (num === 1 || (num > 0 && num < den)) {
+                value = `1/${Math.round(den / num)} s`;
+              } else {
+                value = `${(num / den).toFixed(2)} s`;
+              }
+            } else if (fieldKey === "FNumber" || fieldKey === "ApertureValue" || fieldKey === "MaxApertureValue") {
+              value = `f/${(num / den).toFixed(1).replace(/\.0$/, "")}`;
+            } else if (fieldKey === "FocalLength") {
+              value = `${(num / den).toFixed(1).replace(/\.0$/, "")} mm`;
+            } else if (fieldKey === "ExposureBiasValue") {
+              const ev = num / den;
+              value = `${ev >= 0 ? "+" : ""}${ev.toFixed(2)} EV`;
+            } else if (fieldKey === "GPSAltitude") {
+              value = `${(num / den).toFixed(1)} m`;
+            } else {
+              value = den === 1 ? String(num) : `${num}/${den}`;
+            }
+          } else {
+            const items: string[] = [];
+            for (let c = 0; c < Math.min(count, 4); c++) {
+              const num = r32(dataPtr + c * 8);
+              const den = r32(dataPtr + c * 8 + 4) || 1;
+              items.push(den === 1 ? String(num) : `${num}/${den}`);
+            }
+            value = items.join(", ") + (count > 4 ? ` (+${count - 4} more)` : "");
+          }
+        } else if (type === 7 && count <= 16) {
+          if (fieldKey === "ExifVersion" || fieldKey === "FlashpixVersion") {
+            value = [...body.subarray(dataPtr, dataPtr + count)]
+              .map((x) => String.fromCharCode(x))
+              .join("");
+          } else {
+            value = [...body.subarray(dataPtr, dataPtr + count)]
+              .map((x) => String.fromCharCode(x))
+              .join("");
+          }
         } else {
           value = `${count}×type${type}`;
         }
       } catch {
         value = "(unreadable)";
       }
-      if (value) fields.push({ key: name, value, group });
+      if (value) fields.push({ key: fieldKey, value, group });
     }
   };
   walk(r32(4), "IFD0", 0);
@@ -370,6 +560,7 @@ function parsePng(bytes: Uint8Array, fields: MetaField[], warnings: string[]) {
       fields.push({ key: "PNG.iCCP", value: "embedded ICC profile present", group: "PNG" });
     } else if (type === "eXIf") {
       fields.push({ key: "PNG.eXIf", value: `embedded EXIF (${data.length} bytes)`, group: "PNG" });
+      readExifFields(data, fields);
     }
     if (type === "IEND") break;
     p += 12 + len;
@@ -447,6 +638,16 @@ export function parseMedia(bytes: Uint8Array, mimeHint?: string): ParsedMedia {
     kind = "webp";
     mime = "image/webp";
     fields.push({ key: "Format", value: "WebP", group: "File" });
+    // Scan WebP RIFF chunks for EXIF
+    let p = 12;
+    while (p + 8 <= bytes.length) {
+      const fourcc = utf8(bytes.subarray(p, p + 4));
+      const chunkLen = u32le(bytes, p + 4);
+      if (fourcc === "EXIF" && p + 8 + chunkLen <= bytes.length) {
+        readExifFields(bytes.subarray(p + 8, p + 8 + chunkLen), fields);
+      }
+      p += 8 + chunkLen + (chunkLen % 2);
+    }
   } else if (
     (bytes[0] === 0x49 && bytes[1] === 0x49) ||
     (bytes[0] === 0x4d && bytes[1] === 0x4d)
@@ -454,6 +655,7 @@ export function parseMedia(bytes: Uint8Array, mimeHint?: string): ParsedMedia {
     kind = "tiff";
     mime = "image/tiff";
     fields.push({ key: "Format", value: "TIFF", group: "File" });
+    readExifFields(bytes, fields);
   } else {
     fields.push({ key: "Format", value: "Unknown / decoded via browser", group: "File" });
   }

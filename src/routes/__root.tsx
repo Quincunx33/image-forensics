@@ -1,9 +1,49 @@
+import { useEffect } from "react";
 import { HeadContent, Outlet, Scripts, createRootRoute } from "@tanstack/react-router";
 import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
 const APP_NAME = "Tracebench";
+
+function RootComponent() {
+  useEffect(() => {
+    const handleErr = (e: ErrorEvent) => {
+      if (
+        e &&
+        (e.message === "ResizeObserver loop completed with undelivered notifications." ||
+          e.message === "ResizeObserver loop limit exceeded" ||
+          (typeof e.message === "string" && e.message.includes("ResizeObserver loop")))
+      ) {
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("error", handleErr, true);
+    return () => window.removeEventListener("error", handleErr, true);
+  }, []);
+
+  return (
+    <html lang="en" className="dark antialiased" suppressHydrationWarning>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `window.addEventListener('error',function(e){if(e&&(e.message==='ResizeObserver loop completed with undelivered notifications.'||e.message==='ResizeObserver loop limit exceeded'||(typeof e.message==='string'&&e.message.includes('ResizeObserver loop')))){e.stopImmediatePropagation();e.stopPropagation();e.preventDefault();return true;}},true);`,
+          }}
+        />
+        <HeadContent />
+      </head>
+      <body className="bg-bg font-sans text-fg">
+        <PreviewHostBridge />
+        <AuthProvider>
+          <Outlet />
+        </AuthProvider>
+        <Scripts />
+      </body>
+    </html>
+  );
+}
 
 export const Route = createRootRoute({
   head: () => ({
@@ -30,18 +70,5 @@ export const Route = createRootRoute({
       },
     ],
   }),
-  component: () => (
-    <html lang="en" className="dark antialiased" suppressHydrationWarning>
-      <head>
-        <HeadContent />
-      </head>
-      <body className="bg-bg font-sans text-fg">
-        <PreviewHostBridge />
-        <AuthProvider>
-          <Outlet />
-        </AuthProvider>
-        <Scripts />
-      </body>
-    </html>
-  ),
+  component: RootComponent,
 });

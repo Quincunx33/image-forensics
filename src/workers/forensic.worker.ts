@@ -242,7 +242,7 @@ async function runModule(module: ModuleId, params: DetectorParams): Promise<Heat
       return wrap("dct", {
         gray: freq.gray,
         stats: freq.stats,
-        extra: { ...(freq.extra ?? {}), doubleJpeg: dj.extra ?? { periodicityScore: (dj as { extra?: { periodicityScore: number } }).extra } },
+        extra: { ...((freq as any).extra ?? {}), doubleJpeg: dj.extra ?? { periodicityScore: (dj as { extra?: { periodicityScore: number } }).extra } },
       });
     }
     case "frequency":
@@ -276,7 +276,7 @@ async function runModule(module: ModuleId, params: DetectorParams): Promise<Heat
       const extra = useWasm ? wasm!.jpegJson() : (parsed?.jpeg ?? null);
       return heatmap("jpeg", new Uint8Array(width * height), {
         mean: 0, median: 0, std: 0, min: 0, max: 0, p05: 0, p95: 0, p99: 0, energy: 0, entropy: 0,
-      }, extra ?? undefined);
+      }, (extra as Record<string, unknown>) ?? undefined);
     }
     case "thumbnail": {
       const thumbBytes = parsed?.thumbnailJpeg;
@@ -425,3 +425,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
     post(id, { type: "error", error: err instanceof Error ? err.message : String(err) });
   }
 };
+
+self.onerror = (message, source, lineno, colno, error) => {
+  console.error("Forensic worker unhandled error:", message, error);
+  return true; // Prevent propagation
+};
+

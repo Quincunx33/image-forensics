@@ -62,6 +62,7 @@ export class ForensicClient {
       }
     };
     this.worker.onerror = (err) => {
+      err.preventDefault();
       this.onMessage?.({ id: 0, type: "error", error: err.message || "Worker error" });
     };
   }

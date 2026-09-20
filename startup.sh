@@ -1,6 +1,5 @@
 #!/bin/sh
 set -eu
-cd /workspace
 node scripts/preview.mjs stop || true
 if [ ! -f public/forensic-engine.wasm ]; then
   sh scripts/build-wasm.sh || true

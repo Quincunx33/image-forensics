@@ -33,6 +33,7 @@ interface LabState {
   media: MediaState | null;
   original: ImageBitmap | null;
   thumbnail: ImageBitmap | null;
+  fileBase64: string | null;
   maps: Partial<Record<ModuleId, Heatmap>>;
   evidence: EvidenceEntry[];
   params: DetectorParams;
@@ -45,7 +46,7 @@ interface LabState {
   activeRoi: string | null;
   regions: AutoRegion[];
   custody: CustodyEvent[];
-  bottomTab: "histogram" | "pixel" | "evidence" | "params" | "structure" | "methods";
+  bottomTab: "histogram" | "pixel" | "evidence" | "params" | "structure" | "methods" | "exif";
   navOpen: boolean;
   init: () => Promise<void>;
   loadFile: (file: File) => Promise<void>;
@@ -129,6 +130,7 @@ export const useLab = create<LabState>((set, get) => ({
   media: null,
   original: null,
   thumbnail: null,
+  fileBase64: null,
   maps: {},
   evidence: [],
   params: { ...DEFAULT_PARAMS },
@@ -168,15 +170,72 @@ export const useLab = create<LabState>((set, get) => ({
 
   loadFile: async (file) => {
     get().resetCase();
-    set({ progress: { pct: 1, label: "Reading" }, error: null });
-    const buffer = await file.arrayBuffer();
-    client.load(buffer, file.name, file.type);
+    if (!file) {
+      set({ error: "No file was selected for analysis." });
+      return;
+    }
+    
+    // Safety size threshold to prevent tab crash on giant images
+    const maxSizeBytes = 35 * 1024 * 1024; // 35MB cap
+    if (file.size > maxSizeBytes) {
+      set({
+        error: `File size limit exceeded: Selected file is ${fmtBytes(file.size)}. Maximum supported image size for in-memory WASM analysis is 35 MB.`,
+      });
+      return;
+    }
+
+    // MIME type and file extension verification
+    const validMimes = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/bmp", "image/x-tiff"];
+    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+    const validExts = ["jpg", "jpeg", "png", "webp", "gif", "tif", "tiff", "bmp"];
+    
+    if (!validMimes.includes(file.type) && !validExts.includes(ext)) {
+      set({
+        error: `Unsupported file type: "${file.name}" (${file.type || "unknown"}). Please load a standard raster image (JPEG, PNG, WebP, TIFF, BMP, or GIF).`,
+      });
+      return;
+    }
+
+    // Read the file as Base64 for reporting
+    try {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        if (e.target?.result) {
+          set({ fileBase64: e.target.result as string });
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (e) {
+      console.error("Failed to read file as DataURL", e);
+    }
+
+    try {
+      set({ progress: { pct: 5, label: "Reading binary payload..." }, error: null });
+      const buffer = await file.arrayBuffer();
+      if (!buffer || buffer.byteLength === 0) {
+        throw new Error("File array buffer is empty or corrupted (0 bytes read).");
+      }
+      set({ progress: { pct: 15, label: "Allocating WASM memory buffers..." } });
+      client.load(buffer, file.name, file.type);
+    } catch (err) {
+      set({
+        error: `Forensic Ingestion Error: ${err instanceof Error ? err.message : "Failed to load file. It might be corrupted or in an unrecognized format."}`,
+        progress: null,
+      });
+    }
   },
 
   loadDemo: () => {
-    get().resetCase();
-    set({ progress: { pct: 1, label: "Generating synthetic case" }, error: null });
-    client.demo();
+    try {
+      get().resetCase();
+      set({ progress: { pct: 5, label: "Synthesizing test raster structure..." }, error: null });
+      client.demo();
+    } catch (err) {
+      set({
+        error: `Demo Generation Error: ${err instanceof Error ? err.message : "Failed to instantiate simulation demo workspace."}`,
+        progress: null,
+      });
+    }
   },
 
   runSuite: () => {
@@ -211,6 +270,7 @@ export const useLab = create<LabState>((set, get) => ({
       media: null,
       original: null,
       thumbnail: null,
+      fileBase64: null,
       maps: {},
       evidence: [],
       pixel: null,
@@ -238,11 +298,29 @@ function handle(
   }
   if (msg.type === "loaded") {
     const m = msg as LoadedPayload & { id: number; type: "loaded" };
-    let thumbBmp: ImageBitmap | null = null;
+    const thumbBmp: ImageBitmap | null = null;
     const ev = [
       metadataEvidence(m.media, m.media.warnings),
       jpegEvidence(m.media),
     ];
+    
+    // Generate fileBase64 from the loaded ImageBitmap if not already set (e.g. for Demo mode)
+    if (!get().fileBase64 && m.original) {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = m.original.width;
+        canvas.height = m.original.height;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(m.original, 0, 0);
+          const base64 = canvas.toDataURL("image/jpeg", 0.85);
+          set({ fileBase64: base64 });
+        }
+      } catch (e) {
+        console.error("Failed to generate demo image base64", e);
+      }
+    }
+
     set({
       caseRecord: m.caseRecord,
       media: m.media,
