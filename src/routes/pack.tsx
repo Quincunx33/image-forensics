@@ -204,7 +204,7 @@ function highlightLine(line: string) {
   const tokenRegex =
     /(\/\/[^\n]*|"(?:\\.|[^"\\])*"|'[^']'|\b(?:fn|pub|struct|impl|let|mut|use|mod|const|static|return|match|if|else|for|in|while|loop|unsafe|extern|as|type|enum|trait|where|crate|self|Self|async|await|package|dependencies|profile|release)\b|\b(?:u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f32|f64|bool|char|str|String|Vec|Option|Result|Some|None|Ok|Err|RefCell|Session|Box|Rc|Arc)\b|\b\d+(?:\.\d+)?(?:_?[uif]\d+)?\b|#\[[^\]]+\])/g;
 
-  const parts: (string | JSX.Element)[] = [];
+  const parts: (string | React.ReactNode)[] = [];
   let lastIdx = 0;
   let match: RegExpExecArray | null;
 
@@ -390,7 +390,7 @@ function PackPage() {
             <Badge tone="ok" className="hidden font-mono text-3xs sm:inline-flex">
               v1.0.0
             </Badge>
-            <Badge tone="neutral" className="hidden font-mono text-3xs md:inline-flex">
+            <Badge tone="muted" className="hidden font-mono text-3xs md:inline-flex">
               WASM32 ABI
             </Badge>
           </div>
@@ -581,7 +581,7 @@ function PackPage() {
                   <span className="font-mono text-xs font-semibold text-fg">
                     {current.name}
                   </span>
-                  <Badge tone="neutral" className="text-3xs font-mono">
+                  <Badge tone="muted" className="text-3xs font-mono">
                     {current.lang}
                   </Badge>
                   <span className="font-mono text-3xs text-subtle">

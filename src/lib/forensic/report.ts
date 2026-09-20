@@ -90,7 +90,7 @@ export function reportHtml(model: ReportModel): string {
     .map((e) => {
       const isDanger = e.strength === "inconsistency";
       const isWarn = e.strength === "indicator";
-      const isOk = e.status === "no-residual" || e.status === "no-forgery" || e.status === "aligned";
+      const isOk = e.strength === "none" || e.strength === "weak";
       
       let badgeColor = "bg-neutral-100 text-neutral-800 border-neutral-300";
       if (isDanger) badgeColor = "bg-rose-50 text-rose-700 border-rose-200";
@@ -172,12 +172,12 @@ export function reportHtml(model: ReportModel): string {
       <div class="timeline-badge">${idx + 1}</div>
       <div class="timeline-panel">
         <div class="timeline-heading">
-          <h4 class="timeline-title">${esc(event.type)}</h4>
-          <p><small class="text-muted"><time class="font-mono">${esc(event.time)}</time> · Agent: ${esc(event.agent)}</small></p>
+          <h4 class="timeline-title">${esc(event.operation)}</h4>
+          <p><small class="text-muted"><time class="font-mono">${esc(event.ts)}</time> · Engine: ${esc(event.engine)} (v${esc(event.softwareVersion)})</small></p>
         </div>
         <div class="timeline-body">
-          <p>${esc(event.desc)}</p>
-          ${event.hash ? `<p class="text-xs text-slate-500 mt-1">Hashed block: <code class="bg-slate-100 px-1 py-0.5 rounded font-mono break-all">${esc(event.hash)}</code></p>` : ""}
+          <p>${esc(JSON.stringify(event.parameters))}</p>
+          ${event.hashSha256 ? `<p class="text-xs text-slate-500 mt-1">SHA-256: <code class="bg-slate-100 px-1 py-0.5 rounded font-mono break-all">${esc(event.hashSha256)}</code></p>` : ""}
         </div>
       </div>
     </div>`)

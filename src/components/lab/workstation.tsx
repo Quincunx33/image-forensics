@@ -1120,7 +1120,8 @@ function ExportMenu() {
             canvas.height = m.height;
             const ctx = canvas.getContext("2d");
             if (ctx) {
-              const imgData = new ImageData(new Uint8ClampedArray(rgba.buffer), m.width, m.height);
+              const imgData = ctx.createImageData(m.width, m.height);
+              imgData.data.set(rgba);
               ctx.putImageData(imgData, 0, 0);
               analysisImages.push({
                 title: id.toUpperCase(),

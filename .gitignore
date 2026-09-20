@@ -5,6 +5,8 @@ dist/
 .cache/
 .vite/
 .tanstack/
+.vercel/
+.wrangler/
 
 # Local/project metadata
 .project_id

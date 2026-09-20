@@ -20,6 +20,12 @@ import {
 
 const client = new ForensicClient();
 
+function fmtBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 type MediaState = ParsedMedia & { hasThumbnail?: boolean; warnings: string[] };
 
 interface LabState {

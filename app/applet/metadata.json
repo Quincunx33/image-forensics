@@ -1,6 +1,0 @@
-{
-  "name": "Tracebench",
-  "description": "Local digital image forensics laboratory. Measurements, not verdicts.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
