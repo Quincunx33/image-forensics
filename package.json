@@ -1,5 +1,10 @@
 {
-  "name": "app-builder-workspace",
+  "name": "image-forensics",
+  "homepage": "https://forensics6.pages.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Quincunx33/image-forensics.git"
+  },
   "private": true,
   "sideEffects": false,
   "type": "module",

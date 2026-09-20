@@ -9,12 +9,21 @@
 </p>
 
 <p align="center">
+  <a href="https://forensics6.pages.dev/"><img src="https://img.shields.io/badge/Live%20Demo-forensics6.pages.dev-00b4d8.svg?style=for-the-badge&logo=cloudflarepages&logoColor=white" alt="Live Demo" /></a>
+  <a href="https://github.com/Quincunx33/image-forensics"><img src="https://img.shields.io/badge/GitHub-Quincunx33%2Fimage--forensics-181717.svg?style=for-the-badge&logo=github" alt="GitHub Repository" /></a>
   <a href="#license"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="License: MIT" /></a>
   <a href="#rust--webassembly-core"><img src="https://img.shields.io/badge/Engine-Rust%20%7C%20WASM32-orange.svg?style=for-the-badge&logo=rust" alt="Rust WASM" /></a>
   <a href="#zero-upload-privacy"><img src="https://img.shields.io/badge/Privacy-100%25%20Client--Side-green.svg?style=for-the-badge&logo=shield" alt="Zero Cloud Upload" /></a>
   <a href="https://react.dev"><img src="https://img.shields.io/badge/React-19-61dafb.svg?style=for-the-badge&logo=react" alt="React 19" /></a>
   <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/TypeScript-5.x-3178c6.svg?style=for-the-badge&logo=typescript" alt="TypeScript" /></a>
-  <a href="https://vitejs.dev"><img src="https://img.shields.io/badge/Bundler-Vite%20%2B%20Nitro-purple.svg?style=for-the-badge&logo=vite" alt="Vite" /></a>
+</p>
+
+<p align="center">
+  <a href="https://forensics6.pages.dev/"><strong>🌐 Live Demo: forensics6.pages.dev</strong></a> •
+  <a href="https://github.com/Quincunx33/image-forensics"><strong>📂 GitHub Repository</strong></a> •
+  <a href="#-key-features"><strong>✨ Features</strong></a> •
+  <a href="#-quick-start"><strong>🚀 Quick Start</strong></a> •
+  <a href="#-javascript--typescript-quickstart-client-side-wasm"><strong>💻 SDK Usage</strong></a>
 </p>
 
 ---
@@ -136,8 +145,8 @@ Tracebench is architected as a modern, decoupled web application:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/tracebench.git
-cd tracebench
+git clone https://github.com/Quincunx33/image-forensics.git
+cd image-forensics
 
 # Install dependencies
 npm install
@@ -157,11 +166,15 @@ Open your browser and navigate to `http://localhost:8080` (or `http://localhost:
 npm run build
 ```
 
-### Cloudflare Pages Deployment
-Tracebench is optimized for Cloudflare Pages with zero-configuration worker routing:
+### 🌐 Cloudflare Pages Deployment
+
+The production release is continuously deployed to Cloudflare Pages:
+👉 **[https://forensics6.pages.dev/](https://forensics6.pages.dev/)**
+
+Tracebench is configured with full client-side WASM routing and zero-configuration asset serving:
 ```bash
 CF_PAGES=1 npm run build
-# Deploy the generated dist/ folder to Cloudflare Pages
+# Deploy the generated dist/ directory to Cloudflare Pages
 ```
 
 ### Type Checking & Code Quality
